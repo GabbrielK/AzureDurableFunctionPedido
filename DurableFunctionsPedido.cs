@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics.Eventing.Reader;
 using System.Net.Http;
 using System.Threading.Tasks;
@@ -10,12 +12,11 @@ using Microsoft.Extensions.Logging;
 
 namespace Company.Function
 {
+    [Serializable]
     public class PedidoApprovalRequest
     {
         public int PedidoId { get; set; }
         public decimal Valor { get; set; }
-
-        public bool Resultado {get; set;}
 
         public EnumPedidoEtapa Etapa {get; set;}
 
@@ -26,9 +27,7 @@ namespace Company.Function
             Etapa = etapaAprovacao;
         }
 
-        public PedidoApprovalRequest()
-        {
-        }
+        public PedidoApprovalRequest() { }
     }
 
     public enum EnumPedidoEtapa
@@ -39,7 +38,6 @@ namespace Company.Function
         PedidoEmAnalise = 2,
         [Description("PedidoAprovado")]
         PedidoAprovado = 3
-
     }
 
     public static class DurableFunctionsPedido
@@ -48,7 +46,8 @@ namespace Company.Function
         public static async Task<List<string>> RunOrchestrator(
             [OrchestrationTrigger] IDurableOrchestrationContext context)
         {
-            //ILogger logger = context.CreateReplaySafeLogger();
+            context.SetCustomStatus("PedidoFuncOrchestration");
+
             var outputs = new List<string>();
 
             var parametros = context.GetInput<PedidoApprovalRequest>();
@@ -57,20 +56,34 @@ namespace Company.Function
 
             var infos = parametros;
 
-            // Replace "hello" with the name of your Durable Activity Function.
             var pedidoCriado = await context.CallActivityAsync<bool>(nameof(ProcessarEtapaPedido), infos);
-            outputs.Add("PedidoCriado " + pedidoCriado.ToString());
-            
-            //logger.LogInformation($"Aprovação de Pedido... id {idPedido} valor {valor} etapa {dados.Etapa} resultado {resultadoPedidoCriado}");
+            outputs.Add("Pedido Criado: " + pedidoCriado.ToString());
+
+            context.SetCustomStatus($"Pedido... id {idPedido} valor {valor} etapa {infos.Etapa} resultado {pedidoCriado}");
+
+            var pedidoEmAnalise = false;
+            if (pedidoCriado)
+            {
+                infos.Etapa = EnumPedidoEtapa.PedidoEmAnalise;
+
+                pedidoEmAnalise = await context.CallActivityAsync<bool>(nameof(ProcessarEtapaPedido), infos);
+                outputs.Add("Pedido Em Analise: " + pedidoEmAnalise.ToString());
+
+                context.SetCustomStatus($"Pedido... id {idPedido} valor {valor} etapa {infos.Etapa} resultado {pedidoEmAnalise}");
+            }
+
+            var pedidoAprovado = false;
+            if (pedidoEmAnalise)
+            {
+                infos.Etapa = EnumPedidoEtapa.PedidoAprovado;
+
+                pedidoAprovado = await context.CallActivityAsync<bool>(nameof(ProcessarEtapaPedido), infos);
+                outputs.Add("Pedido Finalizado: " + pedidoAprovado.ToString());
+
+                context.SetCustomStatus($"Pedido... id {idPedido} valor {valor} etapa {infos.Etapa} resultado {pedidoAprovado}");
+            }
 
             return outputs;
-        }
-
-        [FunctionName("PedidoApproval")]
-        public static string SayHello([ActivityTrigger] string name, ILogger log)
-        {
-            log.LogInformation("Saying hello to {name}.", name);
-            return $"Hello {name}!";
         }
 
         [FunctionName(nameof(ProcessarEtapaPedido))]
