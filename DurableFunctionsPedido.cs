@@ -1,33 +1,43 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics.Eventing.Reader;
-using System.Net.Http;
+using System.Runtime.Serialization;
 using System.Threading.Tasks;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Microsoft.Azure.WebJobs.Extensions.Http;
-using Microsoft.Azure.WebJobs.Host;
+using Microsoft.DurableTask;
+using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
+using AuthorizationLevel = Microsoft.Azure.Functions.Worker.AuthorizationLevel;
+using DurableClientAttribute = Microsoft.Azure.Functions.Worker.DurableClientAttribute;
+using HttpTriggerAttribute = Microsoft.Azure.Functions.Worker.HttpTriggerAttribute;
+using OrchestrationTriggerAttribute = Microsoft.Azure.Functions.Worker.OrchestrationTriggerAttribute;
 
 namespace Company.Function
 {
-    [Serializable]
-    public class PedidoApprovalRequest
+    public class PedidoApprovalRequest : ISerializable
     {
         public int PedidoId { get; set; }
         public decimal Valor { get; set; }
 
         public EnumPedidoEtapa Etapa {get; set;}
 
-        public PedidoApprovalRequest(int idPedido, decimal valorPedido, EnumPedidoEtapa etapaAprovacao)
+        public PedidoApprovalRequest(int pedidoId, decimal valorPedido, EnumPedidoEtapa etapaAprovacao)
         {
-            PedidoId = idPedido;
+            PedidoId = pedidoId;
             Valor = valorPedido;
             Etapa = etapaAprovacao;
         }
 
         public PedidoApprovalRequest() { }
+
+        public void GetObjectData(SerializationInfo info, StreamingContext context)
+        {
+            info.AddValue("PedidoId", PedidoId);
+            info.AddValue("Valor", Valor);
+            info.AddValue("Etapa", Etapa.ToString());
+        }
     }
 
     public enum EnumPedidoEtapa
@@ -42,11 +52,11 @@ namespace Company.Function
 
     public static class DurableFunctionsPedido
     {
-        [FunctionName("PedidoFuncOrchestration")]
+        [FunctionName("DurableFunctionsPedido")]
         public static async Task<List<string>> RunOrchestrator(
-            [OrchestrationTrigger] IDurableOrchestrationContext context)
+            [OrchestrationTrigger] TaskOrchestrationContext context)
         {
-            context.SetCustomStatus("PedidoFuncOrchestration");
+            ILogger log = context.CreateReplaySafeLogger("DurableFunctionsPedido");
 
             var outputs = new List<string>();
 
@@ -59,7 +69,12 @@ namespace Company.Function
             var pedidoCriado = await context.CallActivityAsync<bool>(nameof(ProcessarEtapaPedido), infos);
             outputs.Add("Pedido Criado: " + pedidoCriado.ToString());
 
-            context.SetCustomStatus($"Pedido... id {idPedido} valor {valor} etapa {infos.Etapa} resultado {pedidoCriado}");
+            log.LogInformation($"Pedido... id {idPedido} valor {valor} etapa {infos.Etapa} resultado {pedidoCriado}");
+
+            if(!pedidoCriado)
+            {
+                log.LogInformation("Nenhum pedido encontrado.");
+            }
 
             var pedidoEmAnalise = false;
             if (pedidoCriado)
@@ -69,7 +84,7 @@ namespace Company.Function
                 pedidoEmAnalise = await context.CallActivityAsync<bool>(nameof(ProcessarEtapaPedido), infos);
                 outputs.Add("Pedido Em Analise: " + pedidoEmAnalise.ToString());
 
-                context.SetCustomStatus($"Pedido... id {idPedido} valor {valor} etapa {infos.Etapa} resultado {pedidoEmAnalise}");
+                log.LogInformation($"Pedido... id {idPedido} valor {valor} etapa {infos.Etapa} resultado {pedidoEmAnalise}");
             }
 
             var pedidoAprovado = false;
@@ -80,7 +95,7 @@ namespace Company.Function
                 pedidoAprovado = await context.CallActivityAsync<bool>(nameof(ProcessarEtapaPedido), infos);
                 outputs.Add("Pedido Finalizado: " + pedidoAprovado.ToString());
 
-                context.SetCustomStatus($"Pedido... id {idPedido} valor {valor} etapa {infos.Etapa} resultado {pedidoAprovado}");
+                log.LogInformation($"Pedido... id {idPedido} valor {valor} etapa {infos.Etapa} resultado {pedidoAprovado}");
             }
 
             return outputs;
@@ -91,26 +106,40 @@ namespace Company.Function
         {
             logger.LogInformation("Processar Etapa Pedido.");
 
-            var idPedido = pedidos.PedidoId;
-            var valor = pedidos.Valor;
-            var etapa = pedidos.Etapa.ToString();
+            var idPedido = pedidos?.PedidoId;
+            var valor = pedidos?.Valor;
+            var etapa = pedidos?.Etapa.ToString();
 
             logger.LogInformation($"Processando Aprovação do Pedido {idPedido}, valor {valor}, etapa {etapa}.");
         
-            if (pedidos.Etapa == EnumPedidoEtapa.PedidoAprovado)
-                return true;
-            else
-                return false;
+            if(pedidos != null)
+            {
+                if (pedidos.Etapa == EnumPedidoEtapa.PedidoAprovado)
+                    return true;
+                else
+                    return false;
+            }
+
+            return false;
         }
 
         [FunctionName("DurableFunctionsPedido_HttpStart")]
-        public static async Task<HttpResponseMessage> HttpStart(
-            [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post")] HttpRequestMessage req,
-            [DurableClient] IDurableOrchestrationClient starter,
-            ILogger log)
+        public static async Task<HttpResponseData> HttpStart(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post")] HttpRequestData req,
+            [DurableClient] DurableTaskClient starter,
+            FunctionContext context)
         {
+            ILogger log = context.GetLogger(nameof(HttpStart));
+
+            log.LogInformation(nameof(HttpStart));
+
+            var parametros = new PedidoApprovalRequest();
+            parametros.PedidoId = Convert.ToInt32(req.Query["idPedido"]);
+            parametros.Valor = Convert.ToDecimal(req.Query["valor"]);
+            parametros.Etapa = EnumPedidoEtapa.PedidoCriado;
+
             // Function input comes from the request content.
-            string instanceId = await starter.StartNewAsync("DurableFunctionsPedido", null);
+            string instanceId = await starter.ScheduleNewOrchestrationInstanceAsync("DurableFunctionsPedido", parametros);
 
             log.LogInformation("Started orchestration with ID = '{instanceId}'.", instanceId);
 
